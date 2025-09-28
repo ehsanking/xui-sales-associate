@@ -81,7 +81,7 @@ Cloudflare → your Worker → **Settings → Variables**.
 ### Worker Code (v1.0.1)
 
 ```js
-// Worker v1.0.1 — 3x-ui Official API Compatible (addClient + update/:id), with CSRF & verify
+// Worker v1.0.1 — 3x-ui Official API Compatible - by EHSANKiNG(https://t.me/VPN_SalesAssociate)
 export default {
   async fetch(request, env, ctx) {
     const origin = request.headers.get("Origin") || "";
