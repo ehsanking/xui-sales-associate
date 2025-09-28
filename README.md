@@ -78,7 +78,7 @@ Cloudflare → your Worker → **Settings → Variables**.
 - `X-Alsxui-Secret: <SHARED_SECRET>`
 - `X-Alsxui-Action: add` | `details`
 
-### Worker Code (v1.0.0)
+### Worker Code (v1.0.1)
 
 ```js
 // Worker v1.0.1 — 3x-ui Official API Compatible (addClient + update/:id), with CSRF & verify
