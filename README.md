@@ -19,7 +19,7 @@ The plugin calls a secure **Cloudflare Worker**; the Worker logs into 3x-ui, add
 - [Quick Start](#quick-start)
 - [Step-by-Step — Cloudflare Worker](#step-by-step--cloudflare-worker)
   - [Environment Variables](#environment-variables)
-  - [Worker Code (v1.0.0)](#worker-code-v100)
+  - [Worker Code (v1.0.1)](#worker-code-v101)
   - [Test with curl (examples)](#test-with-curl-examples)
 - [Step-by-Step — WordPress Plugin](#step-by-step--wordpress-plugin)
 - [Data Model / Units](#data-model--units)
