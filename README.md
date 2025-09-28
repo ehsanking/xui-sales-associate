@@ -81,97 +81,498 @@ Cloudflare → your Worker → **Settings → Variables**.
 ### Worker Code (v1.0.0)
 
 ```js
-// Worker v1.0.0 – XUI-SA – by EHSANKiNG
+// Worker v1.0.1 — 3x-ui Official API Compatible (addClient + update/:id), with CSRF & verify
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const origin = request.headers.get("Origin") || "";
-    const allowed = (env.ALLOWED_ORIGINS || "").split(",").map(s=>s.trim()).filter(Boolean);
-    const cors = {
-      "Access-Control-Allow-Origin": allowed.length && allowed.includes(origin) ? origin : "*",
-      "Access-Control-Allow-Headers": "Content-Type, X-Alsxui-Secret, X-Alsxui-Action",
-      "Access-Control-Allow-Methods": "POST, OPTIONS"
+    const allowed = (env.ALLOWED_ORIGINS || "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean);
+    const CORS = {
+      "Access-Control-Allow-Origin":
+        allowed.length && allowed.includes(origin) ? origin : "*",
+      "Access-Control-Allow-Headers":
+        "Content-Type, X-Alsxui-Secret, X-Alsxui-Action",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Expose-Headers": "Content-Type",
     };
-    if (request.method === "OPTIONS") return new Response(null,{status:204,headers:cors});
-    if (request.method !== "POST") return new Response("Method Not Allowed", {status:405});
 
-    // Auth
-    const secret = request.headers.get("X-Alsxui-Secret");
-    if (!secret || secret !== env.SHARED_SECRET) return new Response("Unauthorized", {status:401});
+    if (request.method === "OPTIONS")
+      return new Response(null, { status: 204, headers: CORS });
+    if (request.method !== "POST")
+      return j({ ok: false, error: "method_not_allowed" }, CORS, 405);
 
-    const action = request.headers.get("X-Alsxui-Action") || "add";
-    let payload = {}; try { payload = await request.json(); } catch { return new Response("Bad JSON",{status:400}); }
+    try {
+      // --- auth to worker
+      const secret = request.headers.get("X-Alsxui-Secret");
+      if (!secret || secret !== (env.SHARED_SECRET || "")) {
+        return j({ ok: false, error: "unauthorized" }, CORS, 401);
+      }
 
-    const panel=(env.PANEL_URL||"").replace(/\/+$/,"");
-    const user=env.PANEL_USER; const pass=env.PANEL_PASS;
-    if(!panel||!user||!pass) return new Response("Missing PANEL_*",{status:500});
+      // --- parse action & payload
+      let payload = {};
+      try {
+        payload = await request.json();
+      } catch {
+        return j({ ok: false, error: "bad_json" }, CORS, 400);
+      }
+      const action = String(
+        payload.action || request.headers.get("X-Alsxui-Action") || "add"
+      ).toLowerCase();
 
-    // --- login
-    const login=await fetch(panel+"/login",{
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({username:user,password:pass})
-    });
-    if(login.status!==200) return res("Login failed: "+login.status+" "+await login.text(),502,cors);
-    const cookie=(login.headers.get("set-cookie")||"").split(";")[0];
+      // quick probes
+      if (action === "ping") return j({ ok: true, worker: "1.2.0" }, CORS);
+      if (action === "whoami")
+        return j(
+          {
+            ok: true,
+            panel_url: (env.PANEL_URL || "").replace(/\/+$/, ""),
+            has_user: !!env.PANEL_USER,
+            has_pass: !!env.PANEL_PASS,
+          },
+          CORS
+        );
 
-    // helpers
-    function token(n=16){ const a=new Uint8Array(n); crypto.getRandomValues(a);
-      const abc="abcdefghijklmnopqrstuvwxyz0123456789"; let out=""; a.forEach(v=>out+=abc[v%abc.length]); return out; }
+      // --- env sanity
+      const PANEL = (env.PANEL_URL || "").replace(/\/+$/, "");
+      const USER = env.PANEL_USER;
+      const PASS = env.PANEL_PASS;
+      if (!PANEL || !USER || !PASS)
+        return j(
+          {
+            ok: false,
+            error: "missing_env",
+            missing: { panel: !PANEL, user: !USER, pass: !PASS },
+          },
+          CORS,
+          500
+        );
 
-    async function getInbound(inbound_id){
-      const r=await fetch(panel+"/panel/api/inbounds/get/"+Number(inbound_id||1),{headers:{"Cookie":cookie}});
-      if(r.status!==200) throw new Error("get inbound failed: "+r.status);
-      return r.json();
-    }
-    function parseClientsFromInbound(j){ try{ const s=JSON.parse(j?.obj?.settings||"{}"); return Array.isArray(s.clients)?s.clients:[] }catch{ return [] } }
-    async function updateClientSubId(inbound_id, clientObj){
-      const body={ id:Number(inbound_id||1), settings:JSON.stringify({clients:[clientObj]}) };
-      const r=await fetch(panel+"/panel/api/inbounds/updateClient/",{
-        method:"POST", headers:{"Content-Type":"application/json","Cookie":cookie},
-        body:JSON.stringify(body)
+      // --- login
+      const login = await fetch(PANEL + "/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ username: USER, password: PASS }),
+        redirect: "manual",
       });
-      if(r.status!==200) throw new Error("updateClient failed: "+r.status+" "+await r.text());
-      return r.json();
-    }
-    async function findClient(inbound_id, key){
-      const inb=await getInbound(inbound_id); const clients=parseClientsFromInbound(inb);
-      return clients.find(c => c.id===key || c.uuid===key || c.email===key) || null;
-    }
-    async function ensureSubId(inbound_id, client){
-      if(client?.subId) return client.subId;
-      const subId = token(16); const merged = {...client, subId};
-      await updateClientSubId(inbound_id, merged); return subId;
-    }
 
-    async function addClient({uuid,email,limit_ip=0,total_gb=50,expiry_ms=0,inbound_id=1}){
-      const subId = (payload && payload.subId) ? String(payload.subId) : token(16);
-      const bytes = Number(total_gb||50) * 1024 * 1024 * 1024; // GB→bytes
-      const clientObj = { id: uuid, flow:"", email, limitIp:Number(limit_ip||0), totalGB:bytes, total:bytes,
-                          expiryTime:Number(expiry_ms||0), enable:true, tgId:"", subId };
-      const settings={clients:[clientObj]};
-      const r=await fetch(panel+"/panel/api/inbounds/addClient",{
-        method:"POST", headers:{"Content-Type":"application/json","Cookie":cookie},
-        body:JSON.stringify({ id:Number(inbound_id||1), settings:JSON.stringify(settings) })
+      const cookiesMerged = mergeCookies(login.headers);
+      if (login.status !== 200 && login.status !== 302) {
+        return j(
+          { ok: false, error: "login_failed", status: login.status },
+          CORS,
+          502
+        );
+      }
+      if (!cookiesMerged) {
+        return j({ ok: false, error: "no_session_cookie" }, CORS, 502);
+      }
+
+      // warm /panel/ (and extract CSRF if present)
+      let cookieHeader = cookiesMerged;
+      const panelResp = await fetch(PANEL + "/panel/", {
+        headers: { Cookie: cookieHeader, Accept: "text/html" },
       });
-      const t=await r.text(); if(r.status!==200) throw new Error("AddClient failed: "+r.status+" "+t);
-      return { ok:true, created: parse(t), uuid, subId };
-    }
+      const html = await panelResp.text();
+      const more = mergeCookies(panelResp.headers);
+      if (more) cookieHeader = cookieHeader + "; " + more;
 
-    async function fetchClientDetails({uuid,inbound_id=1}){
-      const c=await findClient(inbound_id, uuid); if(!c) return json({ok:false,error:"not found"}, cors, 404);
-      let subId=c.subId||""; if(!subId){ try{ subId=await ensureSubId(inbound_id, c); }catch(e){} }
-      return json({ ok:true, subId, client: {...c, ...(subId?{subId}:{})} }, cors);
-    }
+      const csrfToken =
+        // meta tag
+        (html.match(
+          /<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i
+        ) || [])[1] ||
+        // hidden input
+        (html.match(
+          /<input[^>]+name=["']_csrf["'][^>]+value=["']([^"']+)["']/i
+        ) || [])[1] ||
+        // cookie names sometimes used
+        (cookieHeader.match(/XSRF-TOKEN=([^;]+)/) || [])[1] ||
+        (cookieHeader.match(/csrfToken=([^;]+)/) || [])[1] ||
+        "";
 
-    try{
-      if(action==="add")     return json(await addClient(payload), cors);
-      if(action==="details") return await fetchClientDetails(payload);
-      return res("Unknown action",400,cors);
-    }catch(e){ return res(String(e),502,cors); }
-  }
+      const H = {
+        Cookie: cookieHeader,
+        Accept: "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+        Referer: PANEL + "/panel/",
+      };
+      if (csrfToken) H["X-CSRF-Token"] = csrfToken;
+
+      // --- helpers
+      function token(n = 16) {
+        const arr = new Uint8Array(n);
+        crypto.getRandomValues(arr);
+        const abc = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let o = "";
+        for (let i = 0; i < n; i++) o += abc[arr[i] % abc.length];
+        return o;
+      }
+      function toBytes(gb) {
+        const n = Number(gb || 0);
+        if (!isFinite(n) || n <= 0) return 0;
+        return Math.round(n * 1024 * 1024 * 1024);
+      }
+      function norm(s) {
+        return String(s || "").trim().toLowerCase();
+      }
+
+      async function api(path, options = {}) {
+        return fetch(PANEL + path, {
+          ...options,
+          headers: { ...(options.headers || {}), ...H },
+        });
+      }
+
+      // Official 3x-ui endpoints
+      const EP = {
+        LIST: "/panel/api/inbounds/list",
+        GET: (id) => `/panel/api/inbounds/get/${Number(id)}`,
+        ADD: "/panel/api/inbounds/addClient",
+        UPDATE: (id) => `/panel/api/inbounds/update/${Number(id)}`, // ID in PATH
+      };
+
+      async function listInbounds() {
+        const r = await api(EP.LIST);
+        const t = await r.text();
+        if (r.status !== 200) return [];
+        try {
+          const j = JSON.parse(t);
+          return Array.isArray(j?.obj) ? j.obj : [];
+        } catch {
+          return [];
+        }
+      }
+
+      async function getInboundObj(id) {
+        const r = await api(EP.GET(id));
+        const t = await r.text();
+        if (r.status !== 200) return null;
+        try {
+          const j = JSON.parse(t);
+          return j?.obj || null;
+        } catch {
+          return null;
+        }
+      }
+
+      function parseClients(inbObj) {
+        try {
+          const s = JSON.parse(inbObj?.settings || "{}");
+          return Array.isArray(s.clients) ? s.clients : [];
+        } catch {
+          return [];
+        }
+      }
+
+      function writeClients(inbObj, clients) {
+        let s = {};
+        try {
+          s = JSON.parse(inbObj?.settings || "{}");
+        } catch {
+          s = {};
+        }
+        s.clients = clients;
+        inbObj.settings = JSON.stringify(s);
+        return inbObj;
+      }
+
+      async function updateInbound(inbObj, inboundId) {
+        // Official: /panel/api/inbounds/update/:id  with JSON body = full obj
+        // Try JSON first
+        let r = await api(EP.UPDATE(inboundId), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(inbObj),
+        });
+        if (r.status === 200) return { ok: true, via: "json" };
+
+        // Fallback: form-encoded (some forks accept)
+        const form = new URLSearchParams();
+        for (const [k, v] of Object.entries(inbObj)) {
+          form.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+        }
+        if (csrfToken) form.append("_csrf", csrfToken);
+        r = await api(EP.UPDATE(inboundId), {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: form.toString(),
+        });
+        if (r.status === 200) return { ok: true, via: "form" };
+
+        return { ok: false, status: r.status, text: await r.text() };
+      }
+
+      async function addClientOfficial({ inbound_id, client }) {
+        // Official: POST /panel/api/inbounds/addClient
+        // Body: { id: <inbound_id>, settings: "<stringified JSON with clients:[client]>" }
+        const settingsStr = JSON.stringify({ clients: [client] });
+        const body = JSON.stringify({ id: Number(inbound_id), settings: settingsStr });
+
+        // Try JSON
+        let r = await api(EP.ADD, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+        if (r.status === 200) return { ok: true, via: "json" };
+
+        // Fallback: form-encoded
+        const form = new URLSearchParams();
+        form.append("id", String(Number(inbound_id)));
+        form.append("settings", settingsStr);
+        if (csrfToken) form.append("_csrf", csrfToken);
+        r = await api(EP.ADD, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: form.toString(),
+        });
+        if (r.status === 200) return { ok: true, via: "form" };
+
+        return { ok: false, status: r.status, text: await r.text() };
+      }
+
+      async function findClientAnywhere(key) {
+        const nkey = norm(key);
+        const all = await listInbounds();
+        for (const inb of all) {
+          const obj = await getInboundObj(inb.id);
+          const clients = parseClients(obj);
+          const hit = clients.find((c) =>
+            [c.id, c.uuid, c.email].filter(Boolean).map(norm).includes(nkey)
+          );
+          if (hit) {
+            return {
+              inbound_id: inb.id,
+              inbound_remark: inb.remark || null,
+              client: hit,
+            };
+          }
+        }
+        return null;
+      }
+
+      // ---- UPSERT flow
+      if (["add", "upsert", "renew"].includes(action)) {
+        const inbound_id = payload.inbound_id ?? 1;
+        const email = String(payload.email || "").trim();
+        const uuid = String(payload.uuid || "").trim();
+        const key = email || uuid;
+        if (!key) return j({ ok: false, error: "missing email/uuid" }, CORS, 400);
+
+        const addBytes = toBytes(payload.total_gb ?? payload.add_gb ?? 0);
+        const extendDays =
+          payload.extend_days != null ? Number(payload.extend_days) : 0;
+        const extendMs =
+          payload.extend_ms != null
+            ? Number(payload.extend_ms)
+            : extendDays * 24 * 60 * 60 * 1000;
+        const absoluteExpiry =
+          payload.expiry_ms != null && payload.expiry_is_duration !== true
+            ? Number(payload.expiry_ms)
+            : 0;
+
+        // 1) Get inbound
+        const inbObj = await getInboundObj(inbound_id);
+        if (!inbObj)
+          return j(
+            { ok: false, error: "inbound_not_found", inbound_id },
+            CORS,
+            404
+          );
+
+        const clients = parseClients(inbObj);
+        const now = Date.now();
+        const nkey = norm(key);
+        let idx = clients.findIndex((c) =>
+          [c.id, c.uuid, c.email].filter(Boolean).map(norm).includes(nkey)
+        );
+
+        if (idx >= 0) {
+          // 2) RENEW (update full inbound)
+          const existing = clients[idx];
+          const baseExpiry = Math.max(Number(existing.expiryTime || 0) || 0, now);
+          const newExpiry =
+            absoluteExpiry > 0
+              ? absoluteExpiry
+              : extendMs > 0
+              ? baseExpiry + extendMs
+              : Number(existing.expiryTime || 0) || 0;
+
+          const merged = {
+            ...existing,
+            total: Math.max(0, Number(existing.total || 0)) + addBytes,
+            totalGB:
+              Math.max(0, Number(existing.totalGB || 0) || Number(existing.total || 0)) +
+              addBytes,
+            expiryTime: newExpiry > 0 ? newExpiry : Number(existing.expiryTime || 0) || 0,
+            enable: true,
+          };
+          if (!merged.subId) merged.subId = token(16);
+          clients[idx] = merged;
+
+          const updatedObj = writeClients(inbObj, clients);
+          const u = await updateInbound(updatedObj, inbound_id);
+          if (!u.ok) {
+            return j(
+              {
+                ok: false,
+                error: "update_failed",
+                via: u.via || null,
+                status: u.status || null,
+                text: u.text || null,
+                csrf: !!csrfToken,
+              },
+              CORS,
+              502
+            );
+          }
+
+          const v = await findClientAnywhere(key);
+          if (!v) {
+            return j(
+              {
+                ok: false,
+                error: "not_persisted_after_update",
+                via: u.via,
+                csrf: !!csrfToken,
+              },
+              CORS,
+              502
+            );
+          }
+          return j(
+            {
+              ok: true,
+              renewed: true,
+              created: false,
+              uuid: merged.uuid,
+              email: merged.email,
+              subId: merged.subId,
+              verify: v,
+            },
+            CORS
+          );
+        } else {
+          // 3) CREATE (official addClient)
+          const client = {
+            id: uuid || token(8),
+            uuid: uuid || crypto.randomUUID(),
+            flow: "",
+            email,
+            limitIp: Number(payload.limit_ip || 0),
+            total: addBytes,
+            totalGB: addBytes,
+            expiryTime: Number(payload.expiry_ms || 0),
+            enable: true,
+            tgId: "",
+            subId: payload.subId || token(16),
+          };
+
+          const a = await addClientOfficial({ inbound_id, client });
+          if (!a.ok) {
+            // fall back: inject into obj and update/:id
+            const pushed = writeClients(inbObj, [...clients, client]);
+            const u = await updateInbound(pushed, inbound_id);
+            if (!u.ok) {
+              return j(
+                {
+                  ok: false,
+                  error: "add_failed",
+                  add_via: a.via || null,
+                  add_status: a.status || null,
+                  add_text: a.text || null,
+                  update_via: u.via || null,
+                  update_status: u.status || null,
+                  update_text: u.text || null,
+                  csrf: !!csrfToken,
+                },
+                CORS,
+                502
+              );
+            }
+          }
+
+          const v = await findClientAnywhere(key);
+          if (!v) {
+            return j(
+              {
+                ok: false,
+                error: "not_persisted",
+                note: "panel accepted but client not found",
+                csrf: !!csrfToken,
+              },
+              CORS,
+              502
+            );
+          }
+          return j(
+            {
+              ok: true,
+              created: true,
+              renewed: false,
+              uuid: client.uuid,
+              email: client.email,
+              subId: client.subId,
+              verify: v,
+            },
+            CORS
+          );
+        }
+      }
+
+      // Utility: details / verify
+      if (action === "details" || action === "verify") {
+        const key = String(payload.email || payload.uuid || "").trim();
+        if (!key) return j({ ok: false, error: "missing key" }, CORS, 400);
+        const v = await findClientAnywhere(key);
+        if (!v) return j({ ok: false, error: "not_found" }, CORS, 404);
+        if (!v.client.subId) v.client.subId = token(16);
+        return j(
+          {
+            ok: true,
+            subId: v.client.subId,
+            where: { inbound_id: v.inbound_id, inbound_remark: v.inbound_remark },
+          },
+          CORS
+        );
+      }
+
+      return j({ ok: false, error: "unknown_action" }, CORS, 400);
+    } catch (e) {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "exception",
+          message: String(e && e.message ? e.message : e),
+        }),
+        { status: 502, headers: { "Content-Type": "application/json" } }
+      );
+    }
+  },
+};
+
+function j(o, h, s = 200) {
+  return new Response(JSON.stringify(o), {
+    status: s,
+    headers: { "Content-Type": "application/json", ...(h || {}) },
+  });
 }
-function json(o,c,status=200){ return new Response(JSON.stringify(o),{status,headers:{"Content-Type":"application/json",...(c||{})}}); }
-function parse(t){ try{return JSON.parse(t)}catch{return {raw:t}} }
-function res(t,s,c){ return new Response(t,{status:s,headers:c}); }
+
+function mergeCookies(headers) {
+  // Merge all Set-Cookie cookies into a single Cookie header value (name=value; name2=value2)
+  const raw =
+    headers.get("set-cookie") || headers.get("Set-Cookie") || "";
+  if (!raw) return "";
+  // split on commas that separate cookies: , followed by key=
+  const parts = raw.split(/,(?=[^;]+?=)/);
+  const pairs = parts
+    .map((s) => String(s).split(";")[0])
+    .filter(Boolean);
+  return pairs.join("; ");
+}
+
 ```
 
 ### Test with curl (examples)
