@@ -690,3 +690,4 @@ curl -s -X POST "https://YOUR.worker.dev" \
 - 3x-ui (MHSanaei): https://github.com/MHSanaei/3x-ui  
 - Telegram: https://t.me/VPN_SalesAssociate  
 - Developer GitHub: https://github.com/ehsanking/
+- Plugin tutorial: https://www.youtube.com/watch?v=6xSdXoc41TI
